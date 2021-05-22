@@ -1,142 +1,146 @@
-public with sharing class Log {
+/**
+		SavePoint sp = Database.setSavepoint();
+        Log.push('MyClass.methodA');
+            insert new Account(Name = 'Test');
+            Log.push('MyClass.methodB');
+                Log.message('Doing something');
+                insert new Account(Name = 'Test');
+            Log.pop();
+            List<Account> accounts = [select Id from Account];
+            Log.push('MyClass.methodC');        
+                List<Account> accounts2 = [select Id from Account];
+            Log.pop();
+            Log.message('Doing something else');        
+        Log.pop();
+        Database.rollback(sp);        
+		Log.emit();
+**/
 
-	private static final Boolean LOG_VIA_EVENTS = logViaEvents();
-	private static final String ORG_NAMESPACE = [SELECT NamespacePrefix FROM Organization].NamespacePrefix;
-	private static final String CLASSNAME = Log.class.getName();
-	private static final Pattern STACK_LINE = Pattern.compile('^(?:Class\\.)?([^.]+)\\.?([^\\.\\:]+)?[\\.\\:]?([^\\.\\:]*): line (\\d+), column (\\d+)$');
-	private static final String THIS_CONTEXT = timestamp();
+/**
+ * Simple in memory low cpu logging
+ **/
+public class Log {
 
+    private static LogScope current;
+    private static LogScope root;    
+	private static final Integer DML_IDX = 0;
+	private static final Integer SOQL_IDX = 1;    
+	private static final Map<Integer, String> limitsByIdx = 
+        new Map<Integer, String> { DML_IDX => 'DML', SOQL_IDX => 'SQL'};
+    
+    static {
+        reset();
+    }
 
-	// PUBLIC
+	/**
+	 * Push this named scope onto the log stack
+	 **/    
+    public static void push(String scope) {
+		LogScope newScope = new LogScope();
+        newScope.scope = scope;
+        newScope.limits = new List<Integer> { 
+            Limits.getDMLStatements(), 
+			Limits.getQueries() };
+		newScope.parent = Log.current;
+        Log.current.logEntries.add(newScope);
+		Log.current = newScope;        
+    }
+    
+    /**
+     * Add the given message to the scope last pushed
+     **/
+    public static void message(String message) {
+		Log.current.logEntries.add(message);        
+    }
+    
+    /**
+     * Pop the current scope
+     **/
+    public static void pop() {
+        Log.current.limits = new List<Integer> { 
+            Limits.getDMLStatements() - Log.current.limits[DML_IDX], 
+			Limits.getQueries() - Log.current.limits[SOQL_IDX]};
+     	Log.current = Log.current.parent;           
+    }
 
-	public static void debug(String message) {
-		debug(message, new List<Object>(), null);
-	}
-
-
-	public static void debug(String message, List<Object> values) {
-		debug(message, values, null);
-	}
-
-
-	public static void debug(String message, Id contextId) {
-		debug(message, new List<Object>(), contextId);
-	}
-
-
-	public static void debug(Id contextId) {
-		debug('', new List<Object>(), contextId);
-	}
-
-
-	public static void debug(String message, List<Object> values, Id contextId) {
-		emit(message, values, contextId, LoggingLevel.DEBUG);
-	}
-
-
-	public static void error(String message) {
-		error(message, new List<Object>(), null);
-	}
-
-
-	public static void error(String message, List<Object> values) {
-		error(message, values, null);
-	}
-
-
-	public static void error(String message, Id contextId) {
-		error(message, new List<Object>(), contextId);
-	}
-
-
-	public static void error(Id contextId) {
-		error('', new List<Object>(), contextId);
-	}
-
-
-	public static void error(String message, List<Object> values, Id contextId) {
-		emit(message, values, contextId, LoggingLevel.ERROR);
-	}
-
-
-	// PRIVATE
-
-	private static void emit(String message, List<Object> values, Id contextId, LoggingLevel level) {
-		message = String.format(message, cast(values));
-
-		if(LOG_VIA_EVENTS) {
-			currentEvent = new Log__e();
-			currentEvent.txt_User__c = UserInfo.getUserId();
-			currentEvent.txl_Message__c = message;
-			currentEvent.txt_Level__c = level.name();
-			currentEvent.txt_Context__c = (contextId == null) ? THIS_CONTEXT : ''+contextId;
-
-			populateLocation(currentEvent);
-
-			EventBus.publish(currentEvent);
-		}
-		else {
-			System.debug(message);
-		}
-	}
-
-
-	private static List<String> cast(List<Object> values) {
-		List<String> result = new List<String>();
-
-		for(Object value : values) {
-			result.add('' + value);
-		}
-
-		return result;
-	}
-
-
-	public static String timestamp() {
-		return System.now().formatGmt('HH:mm:ss.SSS');
-	}
-
-
-	private static void populateLocation(Log__e logEvent) {
-		// Note: Idea taken from https://salesforce.stackexchange.com/questions/153835
-		List<String> stacktrace = new DmlException().getStackTraceString().split('\n');
-
-		for(String line : stacktrace) {
-			Matcher matcher = STACK_LINE.matcher(line);
-
-			if(matcher.find() && !line.startsWith('Class.' + CLASSNAME + '.')) {
-				Boolean hasNamespace = String.isNotBlank(matcher.group(3));
-
-				if(hasNamespace) {
-					logEvent.txt_Class__c = (matcher.group(1).equals(ORG_NAMESPACE)) ? matcher.group(2) : matcher.group(1) + '.' + matcher.group(2);
-					logEvent.txt_Method__c = prettyMethod(matcher.group(3));
-				}
-				else {
-					logEvent.txt_Class__c = matcher.group(1);
-					logEvent.txt_Method__c = prettyMethod(matcher.group(2));
-				}
-
-				logEvent.num_Line__c = Integer.valueOf(matcher.group(4));
-
-				return;
-			}
-		}
-	}
-
-
-	private static String prettyMethod(String method) {
-		String result = (method == null) ? 'anonymous' : method;
-		return (result.contains('init')) ? 'ctor' : result;
-	}
-
-
-	private static Boolean logViaEvents() {
-		Settings__c settings = Settings__c.getValues(UserInfo.getUserId());
-		return (settings == null) ? false : (System.today() == settings.dat_LogViaEvents__c);
-	}
-
-
-	// Note: Required to allow testing
-	@TestVisible
-	private static Log__e currentEvent = null;
+	/**
+	 * Flush the log entries and serialize 
+	 **/    
+    public static String flush() {
+        List<String> logLines = new List<String>();
+        logLines.add(Log.root.scope);
+        Log.root.flush(logLines, 1);
+        reset();
+		return String.join(logLines, '/n');        
+    }
+    
+    /**
+     * Emits the current log state to the Log__e platform event
+     **/
+    public static void emit() {
+        
+        // Log title is primarly present to allow filtering
+        String title = Log.root.scope;
+        Integer dml = -1;
+        Integer soql = -1;
+        if(Log.root.logEntries.size()>0) {
+	        Object top = Log.root.logEntries[0];
+            if(top instanceof LogScope) {
+				LogScope logScope = (LogScope) top;
+                title = logScope.scope;                
+                dml = logScope.limits[DML_IDX];
+                soql = logScope.limits[SOQL_IDX];
+            } else if (top instanceof String) {
+				title = (String) top;                
+            }
+        }
+        
+        // Emit the log data via Platform Events
+        EventBus.publish(
+            new Log__e(
+                Title__c = title,
+                DML__c = dml,
+                SOQL__c = soql,
+                Data__c = flush()));
+    }    
+    
+    /**
+     * Resets the log state
+     **/
+    private static void reset() {
+        root = current = new LogScope();
+        DateTime now = DateTime.now();
+        current.scope = String.valueOf(now+'.'+now.millisecond());        
+    }
+    
+    /**
+     * Nested log scopes
+     **/
+    private class LogScope {
+        
+        public LogScope parent;
+        public String scope;
+        public List<Integer> limits;
+        public List<Object> logEntries = new List<Object>();
+        
+        public void flush(List<String> logLines, Integer indent) {
+            for(Object logEntry : logEntries) {
+                if(logEntry instanceof LogScope) {
+					LogScope logScope = (LogScope) logEntry;
+                    List<String> limitDiffs = new List<String>();
+                    for(Integer limitIdx : limitsByIdx.keySet()) {
+                        Integer limitVariance = logScope.limits[limitIdx];
+                        if(limitVariance > 0) {
+							limitDiffs.add(limitsByIdx.get(limitIdx)+' ' + limitVariance);
+                        }
+                    }
+                    String limits = limitDiffs.size() > 0 ? '(' + String.join(limitDiffs, ',') + ')' : '';
+                    logLines.add(indent+':'+logScope.scope+' '+limits);
+					logScope.flush(logLines, indent+1);
+                } else {
+					logLines.add(indent+':'+logEntry);                    
+                }
+            }
+        }
+    }    
 }
